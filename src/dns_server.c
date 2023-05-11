@@ -218,6 +218,18 @@ struct dns_request_pending_list {
 typedef DNS_CHILD_POST_RESULT (*child_request_callback)(struct dns_request *request, struct dns_request *child_request,
 														int is_first_resp);
 
+struct dns_request_https {
+	char domain[DNS_MAX_CNAME_LEN];
+	char target[DNS_MAX_CNAME_LEN];
+	int ttl;
+	int priority;
+	char alpn[DNS_MAX_ALPN_LEN];
+	int alpn_len;
+	int port;
+	int ech[DNS_MAX_ECH_LEN];
+	int ech_len;
+};
+
 struct dns_request {
 	atomic_t refcnt;
 
@@ -252,6 +264,7 @@ struct dns_request {
 	struct sockaddr_storage localaddr;
 	int has_ecs;
 	struct dns_opt_ecs ecs;
+	struct dns_request_https *https_svcb;
 
 	dns_result_callback result_callback;
 	void *user_ptr;
@@ -269,6 +282,7 @@ struct dns_request {
 	int ping_time;
 	int ip_ttl;
 	unsigned char ip_addr[DNS_RR_AAAA_LEN];
+	int ip_addr_type;
 
 	struct dns_soa soa;
 	int has_soa;
@@ -557,6 +571,7 @@ static int _dns_server_is_return_soa_qtype(struct dns_request *request, dns_type
 {
 	struct dns_rule_flags *rule_flag = NULL;
 	unsigned int flags = 0;
+	struct dns_qtype_soa_list *soa_list = NULL;
 
 	if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_RULE_SOA) == 0) {
 		/* when both has no rule SOA and force AAAA soa, force AAAA soa has high priority */
@@ -609,6 +624,21 @@ static int _dns_server_is_return_soa_qtype(struct dns_request *request, dns_type
 		if (_dns_server_has_bind_flag(request, BIND_FLAG_FORCE_AAAA_SOA) == 0 || dns_conf_force_AAAA_SOA == 1) {
 			return 1;
 		}
+	}
+
+	if (request->skip_qtype_soa) {
+		return 0;
+	}
+
+	uint32_t key = hash_32_generic(qtype, 32);
+	hash_for_each_possible(dns_qtype_soa_table.qtype, soa_list, node, key)
+	{
+		if (qtype != soa_list->qtypeid) {
+			continue;
+		}
+
+		tlog(TLOG_DEBUG, "force qtype %d soa", qtype);
+		return 1;
 	}
 
 	return 0;
@@ -928,6 +958,64 @@ static void _dns_server_setup_soa(struct dns_request *request)
 	soa->minimum = 86400;
 }
 
+static int _dns_add_rrs_HTTPS(struct dns_server_post_context *context)
+{
+	struct dns_request *request = context->request;
+	struct dns_request_https *https_svcb = request->https_svcb;
+	int ret = 0;
+	struct dns_rr_nested param;
+
+	if (https_svcb == NULL || request->qtype != DNS_T_HTTPS) {
+		return 0;
+	}
+
+	ret = dns_add_HTTPS_start(&param, context->packet, DNS_RRS_AN, https_svcb->domain, https_svcb->ttl,
+							  https_svcb->priority, https_svcb->target);
+	if (ret != 0) {
+		return ret;
+	}
+
+	if (https_svcb->alpn[0] != '\0' && https_svcb->alpn_len > 0) {
+		ret = dns_HTTPS_add_alpn(&param, https_svcb->alpn, https_svcb->alpn_len);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	if (https_svcb->port != 0) {
+		ret = dns_HTTPS_add_port(&param, https_svcb->port);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	if (request->has_ip) {
+		unsigned char *addr[1];
+		addr[0] = request->ip_addr;
+		if (request->ip_addr_type == DNS_T_A) {
+			ret = dns_HTTPS_add_ipv4hint(&param, addr, 1);
+		}
+	}
+
+	if (https_svcb->ech[0] != 0 && https_svcb->ech_len > 0) {
+		ret = dns_HTTPS_add_ech(&param, https_svcb->ech, https_svcb->ech_len);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	if (request->has_ip) {
+		unsigned char *addr[1];
+		addr[0] = request->ip_addr;
+		if (request->ip_addr_type == DNS_T_AAAA) {
+			ret = dns_HTTPS_add_ipv6hint(&param, addr, 1);
+		}
+	}
+
+	dns_add_HTTPS_end(&param);
+	return 0;
+}
+
 static int _dns_add_rrs(struct dns_server_post_context *context)
 {
 	struct dns_request *request = context->request;
@@ -943,6 +1031,10 @@ static int _dns_add_rrs(struct dns_server_post_context *context)
 	if (request->has_cname && context->do_force_soa == 0) {
 		ret |= dns_add_CNAME(context->packet, DNS_RRS_AN, request->domain, request->ttl_cname, request->cname);
 		domain = request->cname;
+	}
+
+	if (request->https_svcb != NULL) {
+		ret = _dns_add_rrs_HTTPS(context);
 	}
 
 	/* add A record */
@@ -1242,7 +1334,7 @@ static int _dns_server_request_update_cache(struct dns_request *request, dns_typ
 	int ttl = 0;
 	int speed = 0;
 
-	if (qtype != DNS_T_A && qtype != DNS_T_AAAA) {
+	if (qtype != DNS_T_A && qtype != DNS_T_AAAA && qtype != DNS_T_HTTPS) {
 		goto errout;
 	}
 
@@ -1467,12 +1559,12 @@ static int _dns_cache_packet(struct dns_server_post_context *context)
 	cache_key.query_flag = request->server_flags;
 
 	if (request->prefetch) {
-		if (dns_cache_replace(&cache_key, context->reply_ttl, -1, request->no_serve_expired, cache_packet) != 0) {
+		if (dns_cache_replace(&cache_key, context->cache_ttl, -1, request->no_serve_expired, cache_packet) != 0) {
 			goto errout;
 		}
 	} else {
 		/* insert result to cache */
-		if (dns_cache_insert(&cache_key, context->reply_ttl, -1, request->no_serve_expired, cache_packet) != 0) {
+		if (dns_cache_insert(&cache_key, context->cache_ttl, -1, request->no_serve_expired, cache_packet) != 0) {
 			goto errout;
 		}
 	}
@@ -1586,7 +1678,7 @@ static int _dns_cache_reply_packet(struct dns_server_post_context *context)
 		return _dns_cache_packet(context);
 	}
 
-	if (context->qtype != DNS_T_AAAA && context->qtype != DNS_T_A) {
+	if (context->qtype != DNS_T_AAAA && context->qtype != DNS_T_A && context->qtype != DNS_T_HTTPS) {
 		return _dns_cache_specify_packet(context);
 	}
 
@@ -2326,6 +2418,9 @@ static void _dns_server_delete_request(struct dns_request *request)
 		_dns_server_conn_release(request->conn);
 	}
 	pthread_mutex_destroy(&request->ip_map_lock);
+	if (request->https_svcb) {
+		free(request->https_svcb);
+	}
 	memset(request, 0, sizeof(*request));
 	free(request);
 }
@@ -2580,6 +2675,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 
 		if (request->ping_time > rtt || request->ping_time == -1) {
 			memcpy(request->ip_addr, &addr_in->sin_addr.s_addr, 4);
+			request->ip_addr_type = DNS_T_A;
 			request->ping_time = rtt;
 			request->has_cname = 0;
 			request->has_ip = 1;
@@ -2597,7 +2693,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 			}
 		}
 
-		if (request->qtype == DNS_T_A) {
+		if (request->qtype == DNS_T_A || request->qtype == DNS_T_HTTPS) {
 			request->has_ping_result = 1;
 		}
 	} break;
@@ -2615,6 +2711,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 				request->has_cname = 0;
 				request->has_ip = 1;
 				memcpy(request->ip_addr, addr_in6->sin6_addr.s6_addr + 12, 4);
+				request->ip_addr_type = DNS_T_A;
 				if (addr_map && addr_map->cname[0] != 0) {
 					request->has_cname = 1;
 					safe_strncpy(request->cname, addr_map->cname, DNS_MAX_CNAME_LEN);
@@ -2623,7 +2720,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 				}
 			}
 
-			if (request->qtype == DNS_T_A) {
+			if (request->qtype == DNS_T_A || request->qtype == DNS_T_HTTPS) {
 				request->has_ping_result = 1;
 			}
 		} else {
@@ -2637,6 +2734,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 				request->has_cname = 0;
 				request->has_ip = 1;
 				memcpy(request->ip_addr, addr_in6->sin6_addr.s6_addr, 16);
+				request->ip_addr_type = DNS_T_AAAA;
 				if (addr_map && addr_map->cname[0] != 0) {
 					request->has_cname = 1;
 					safe_strncpy(request->cname, addr_map->cname, DNS_MAX_CNAME_LEN);
@@ -2645,7 +2743,7 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 				}
 			}
 
-			if (request->qtype == DNS_T_AAAA) {
+			if (request->qtype == DNS_T_AAAA || request->qtype == DNS_T_HTTPS) {
 				request->has_ping_result = 1;
 			}
 		}
@@ -2815,14 +2913,69 @@ static int _dns_server_is_adblock_ipv6(const unsigned char addr[16])
 	return -1;
 }
 
+static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cname, unsigned char addr[4], int ttl,
+										   unsigned int result_flag)
+{
+	int ip_check_result = 0;
+	char ip[DNS_MAX_CNAME_LEN] = {0};
+
+	/* ip rule check */
+	ip_check_result = _dns_server_ip_rule_check(request, addr, 4, DNS_T_A, result_flag);
+	if (ip_check_result == 0) {
+		/* match */
+		return -1;
+	} else if (ip_check_result == -2) {
+		/* skip */
+		return -2;
+	}
+
+	if (atomic_read(&request->ip_map_num) == 0) {
+		request->has_ip = 1;
+		memcpy(request->ip_addr, addr, DNS_RR_A_LEN);
+		request->ip_addr_type = DNS_T_A;
+		request->ip_ttl = _dns_server_get_conf_ttl(request, ttl);
+		if (cname[0] != 0 && request->has_cname == 0 && dns_conf_force_no_cname == 0) {
+			request->has_cname = 1;
+			safe_strncpy(request->cname, cname, DNS_MAX_CNAME_LEN);
+		}
+	} else {
+		if (ttl < request->ip_ttl) {
+			request->ip_ttl = _dns_server_get_conf_ttl(request, ttl);
+		}
+	}
+
+	/* Ad blocking result */
+	if (addr[0] == 0 || addr[0] == 127) {
+		/* If half of the servers return the same result, then ignore this address */
+		if (atomic_inc_return(&request->adblock) <= (dns_server_alive_num() / 2 + dns_server_alive_num() % 2)) {
+			request->rcode = DNS_RC_NOERROR;
+			return -1;
+		}
+	}
+
+	/* add this ip to request */
+	if (_dns_ip_address_check_add(request, cname, addr, DNS_T_A, 0) != 0) {
+		return -1;
+	}
+
+	sprintf(ip, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
+
+	/* start ping */
+	if (_dns_server_check_speed(request, ip) == 0) {
+		/* get reference for ping */
+		_dns_server_request_get(request);
+	}
+
+	return 0;
+}
+
 static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request *request, const char *domain,
 										char *cname, unsigned int result_flag)
 {
 	int ttl = 0;
-	int ip_check_result = 0;
 	unsigned char addr[4];
 	char name[DNS_MAX_CNAME_LEN] = {0};
-	char ip[DNS_MAX_CNAME_LEN] = {0};
+	int ret = 0;
 
 	if (request->qtype != DNS_T_A) {
 		/* ignore non-matched query type */
@@ -2842,21 +2995,31 @@ static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request 
 		return -1;
 	}
 
-	/* ip rule check */
-	ip_check_result = _dns_server_ip_rule_check(request, addr, 4, DNS_T_A, result_flag);
+	ret = _dns_server_process_answer_A_IP(request, cname, addr, ttl, result_flag);
+	_dns_server_request_release(request);
+
+	return ret;
+}
+
+static int _dns_server_process_answer_AAAA_IP(struct dns_request *request, char *cname, unsigned char addr[16], int ttl,
+											  unsigned int result_flag)
+{
+	char ip[DNS_MAX_CNAME_LEN] = {0};
+	int ip_check_result = 0;
+
+	ip_check_result = _dns_server_ip_rule_check(request, addr, 16, DNS_T_AAAA, result_flag);
 	if (ip_check_result == 0) {
 		/* match */
-		_dns_server_request_release(request);
 		return -1;
 	} else if (ip_check_result == -2) {
 		/* skip */
-		_dns_server_request_release(request);
 		return -2;
 	}
 
 	if (atomic_read(&request->ip_map_num) == 0) {
 		request->has_ip = 1;
-		memcpy(request->ip_addr, addr, DNS_RR_A_LEN);
+		memcpy(request->ip_addr, addr, DNS_RR_AAAA_LEN);
+		request->ip_addr_type = DNS_T_AAAA;
 		request->ip_ttl = _dns_server_get_conf_ttl(request, ttl);
 		if (cname[0] != 0 && request->has_cname == 0 && dns_conf_force_no_cname == 0) {
 			request->has_cname = 1;
@@ -2869,26 +3032,27 @@ static int _dns_server_process_answer_A(struct dns_rrs *rrs, struct dns_request 
 	}
 
 	/* Ad blocking result */
-	if (addr[0] == 0 || addr[0] == 127) {
+	if (_dns_server_is_adblock_ipv6(addr) == 0) {
 		/* If half of the servers return the same result, then ignore this address */
 		if (atomic_inc_return(&request->adblock) <= (dns_server_alive_num() / 2 + dns_server_alive_num() % 2)) {
 			request->rcode = DNS_RC_NOERROR;
-			_dns_server_request_release(request);
 			return -1;
 		}
 	}
 
 	/* add this ip to request */
-	if (_dns_ip_address_check_add(request, cname, addr, DNS_T_A, 0) != 0) {
-		_dns_server_request_release(request);
+	if (_dns_ip_address_check_add(request, cname, addr, DNS_T_AAAA, 0) != 0) {
 		return -1;
 	}
 
-	sprintf(ip, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
+	sprintf(ip, "[%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x]", addr[0], addr[1], addr[2],
+			addr[3], addr[4], addr[5], addr[6], addr[7], addr[8], addr[9], addr[10], addr[11], addr[12], addr[13],
+			addr[14], addr[15]);
 
 	/* start ping */
-	if (_dns_server_check_speed(request, ip) != 0) {
-		_dns_server_request_release(request);
+	if (_dns_server_check_speed(request, ip) == 0) {
+		/* Get ping reference */
+		_dns_server_request_get(request);
 	}
 
 	return 0;
@@ -2899,9 +3063,8 @@ static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_reque
 {
 	unsigned char addr[16];
 	char name[DNS_MAX_CNAME_LEN] = {0};
-	char ip[DNS_MAX_CNAME_LEN] = {0};
 	int ttl = 0;
-	int ip_check_result = 0;
+	int ret = 0;
 
 	if (request->qtype != DNS_T_AAAA) {
 		/* ignore non-matched query type */
@@ -2920,55 +3083,115 @@ static int _dns_server_process_answer_AAAA(struct dns_rrs *rrs, struct dns_reque
 		return -1;
 	}
 
-	ip_check_result = _dns_server_ip_rule_check(request, addr, 16, DNS_T_AAAA, result_flag);
-	if (ip_check_result == 0) {
-		/* match */
-		_dns_server_request_release(request);
-		return -1;
-	} else if (ip_check_result == -2) {
-		/* skip */
-		_dns_server_request_release(request);
-		return -2;
-	}
+	ret = _dns_server_process_answer_AAAA_IP(request, cname, addr, ttl, result_flag);
+	_dns_server_request_release(request);
 
-	if (atomic_read(&request->ip_map_num) == 0) {
-		request->has_ip = 1;
-		memcpy(request->ip_addr, addr, DNS_RR_AAAA_LEN);
-		request->ip_ttl = _dns_server_get_conf_ttl(request, ttl);
-		if (cname[0] != 0 && request->has_cname == 0 && dns_conf_force_no_cname == 0) {
-			request->has_cname = 1;
-			safe_strncpy(request->cname, cname, DNS_MAX_CNAME_LEN);
-		}
-	} else {
-		if (ttl < request->ip_ttl) {
-			request->ip_ttl = _dns_server_get_conf_ttl(request, ttl);
-		}
-	}
+	return ret;
+}
 
-	/* Ad blocking result */
-	if (_dns_server_is_adblock_ipv6(addr) == 0) {
-		/* If half of the servers return the same result, then ignore this address */
-		if (atomic_inc_return(&request->adblock) <= (dns_server_alive_num() / 2 + dns_server_alive_num() % 2)) {
-			request->rcode = DNS_RC_NOERROR;
-			_dns_server_request_release(request);
-			return -1;
-		}
-	}
+static int _dns_server_process_answer_HTTPS(struct dns_rrs *rrs, struct dns_request *request, const char *domain,
+											char *cname, unsigned int result_flag)
+{
+	int ttl = 0;
+	int ret = -1;
+	char name[DNS_MAX_CNAME_LEN] = {0};
+	char target[DNS_MAX_CNAME_LEN] = {0};
+	struct dns_https_param *p = NULL;
+	int priority = 0;
+	struct dns_request_https *https_svcb;
 
-	/* add this ip to request */
-	if (_dns_ip_address_check_add(request, cname, addr, DNS_T_AAAA, 0) != 0) {
-		_dns_server_request_release(request);
+	ret = dns_get_HTTPS_svcparm_start(rrs, &p, name, DNS_MAX_CNAME_LEN, &ttl, &priority, target, DNS_MAX_CNAME_LEN);
+	if (ret != 0) {
+		tlog(TLOG_WARN, "get HTTPS svcparm failed");
 		return -1;
 	}
 
-	sprintf(ip, "[%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x]", addr[0], addr[1], addr[2],
-			addr[3], addr[4], addr[5], addr[6], addr[7], addr[8], addr[9], addr[10], addr[11], addr[12], addr[13],
-			addr[14], addr[15]);
-
-	/* start ping */
-	if (_dns_server_check_speed(request, ip) != 0) {
-		_dns_server_request_release(request);
+	https_svcb = request->https_svcb;
+	if (https_svcb == 0) {
+		/* ignore non-matched query type */
+		tlog(TLOG_WARN, "https svcb not set");
+		return -1;
 	}
+
+	tlog(TLOG_DEBUG, "domain: %s HTTPS: %s TTL: %d priority: %d", name, target, ttl, priority);
+	https_svcb->ttl = ttl;
+	https_svcb->priority = priority;
+	safe_strncpy(https_svcb->target, target, sizeof(https_svcb->target));
+	safe_strncpy(https_svcb->domain, name, sizeof(https_svcb->domain));
+	request->ip_ttl = ttl;
+
+	_dns_server_request_get(request);
+	for (; p; p = dns_get_HTTPS_svcparm_next(rrs, p)) {
+		switch (p->key) {
+		case DNS_HTTPS_T_MANDATORY: {
+		} break;
+		case DNS_HTTPS_T_ALPN: {
+			memcpy(https_svcb->alpn, p->value, sizeof(https_svcb->alpn));
+			https_svcb->alpn_len = p->len;
+		} break;
+		case DNS_HTTPS_T_NO_DEFAULT_ALPN: {
+		} break;
+		case DNS_HTTPS_T_PORT: {
+			int port = *(unsigned short *)(p->value);
+			https_svcb->port = ntohs(port);
+		} break;
+		case DNS_HTTPS_T_IPV4HINT: {
+			struct dns_rule_address_IPV4 *address_ipv4 = NULL;
+			if (_dns_server_is_return_soa_qtype(request, DNS_T_A)) {
+				break;
+			}
+
+			if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_RULE_ADDR) == 0) {
+				break;
+			}
+
+			address_ipv4 = _dns_server_get_dns_rule(request, DOMAIN_RULE_ADDRESS_IPV4);
+			if (address_ipv4 != NULL) {
+				memcpy(request->ip_addr, address_ipv4->ipv4_addr, DNS_RR_A_LEN);
+				request->has_ip = 1;
+				request->ip_addr_type = DNS_T_A;
+				break;
+			}
+
+			for (int k = 0; k < p->len / 4; k++) {
+				_dns_server_process_answer_A_IP(request, cname, p->value + k * 4, ttl, result_flag);
+			}
+		} break;
+		case DNS_HTTPS_T_ECH: {
+			if (p->len > sizeof(https_svcb->ech)) {
+				tlog(TLOG_WARN, "ech too long");
+				break;
+			}
+			memcpy(https_svcb->ech, p->value, p->len);
+			https_svcb->ech_len = p->len;
+		} break;
+		case DNS_HTTPS_T_IPV6HINT: {
+			struct dns_rule_address_IPV6 *address_ipv6 = NULL;
+
+			if (_dns_server_is_return_soa_qtype(request, DNS_T_AAAA)) {
+				break;
+			}
+
+			if (_dns_server_has_bind_flag(request, BIND_FLAG_NO_RULE_ADDR) == 0) {
+				break;
+			}
+
+			address_ipv6 = _dns_server_get_dns_rule(request, DOMAIN_RULE_ADDRESS_IPV6);
+			if (address_ipv6 != NULL) {
+				memcpy(request->ip_addr, address_ipv6->ipv6_addr, DNS_RR_AAAA_LEN);
+				request->has_ip = 1;
+				request->ip_addr_type = DNS_T_AAAA;
+				break;
+			}
+
+			for (int k = 0; k < p->len / 16; k++) {
+				_dns_server_process_answer_AAAA_IP(request, cname, p->value + k * 16, ttl, result_flag);
+			}
+		} break;
+		}
+	}
+
+	_dns_server_request_release(request);
 
 	return 0;
 }
@@ -3038,6 +3261,15 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 				safe_strncpy(cname, domain_cname, DNS_MAX_CNAME_LEN);
 				request->ttl_cname = _dns_server_get_conf_ttl(request, ttl);
 				tlog(TLOG_DEBUG, "name: %s ttl: %d cname: %s\n", domain_name, ttl, cname);
+			} break;
+			case DNS_T_HTTPS: {
+				ret = _dns_server_process_answer_HTTPS(rrs, request, domain, cname, result_flag);
+				if (ret == -1) {
+					break;
+				} else if (ret == -2) {
+					continue;
+				}
+				request->rcode = packet->head.rcode;
 			} break;
 			case DNS_T_SOA: {
 				/* if DNS64 enabled, skip check SOA. */
@@ -3502,6 +3734,7 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 			context.do_audit = 1;
 			context.do_reply = 1;
 			context.do_ipset = 1;
+			context.cache_ttl = ttl;
 			context.reply_ttl = ttl;
 			return _dns_server_reply_passthrough(&context);
 		}
@@ -4068,6 +4301,13 @@ static int _dns_server_pre_process_rule_flags(struct dns_request *request)
 			request->dualstack_selection = 0;
 		}
 		break;
+	case DNS_T_HTTPS:
+		if (_dns_server_is_return_soa_qtype(request, DNS_T_A) && _dns_server_is_return_soa_qtype(request, DNS_T_AAAA)) {
+			/* return SOA for HTTPS request */
+			rcode = DNS_RC_NXDOMAIN;
+			goto soa;
+		}
+		break;
 	default:
 		goto out;
 		break;
@@ -4543,6 +4783,19 @@ errout:
 	return -1;
 }
 
+static int _dns_server_process_https_svcb(struct dns_request *request)
+{
+	if (request->https_svcb == NULL) {
+		request->https_svcb = malloc(sizeof(*request->https_svcb));
+		if (request->https_svcb == NULL) {
+			return -1;
+		}
+		memset(request->https_svcb, 0, sizeof(*request->https_svcb));
+	}
+
+	return 0;
+}
+
 static int _dns_server_qtype_soa(struct dns_request *request)
 {
 	struct dns_qtype_soa_list *soa_list = NULL;
@@ -4739,6 +4992,10 @@ static int _dns_server_process_cache(struct dns_request *request)
 	}
 
 	if (request->qtype == DNS_T_A && dns_conf_dualstack_ip_allow_force_AAAA == 0) {
+		goto reply_cache;
+	}
+
+	if (request->qtype == DNS_T_HTTPS) {
 		goto reply_cache;
 	}
 
@@ -4966,10 +5223,11 @@ static int _dns_server_process_special_query(struct dns_request *request)
 			request->passthrough = 1;
 		}
 		break;
+	case DNS_T_HTTPS:
+		break;
 	case DNS_T_A:
 		break;
 	case DNS_T_AAAA:
-
 		break;
 	default:
 		tlog(TLOG_DEBUG, "unsupported qtype: %d, domain: %s", request->qtype, request->domain);
@@ -5016,7 +5274,8 @@ static void _dns_server_check_set_passthrough(struct dns_request *request)
 		request->dualstack_selection = 0;
 	}
 
-	if (request->passthrough == 1 && (request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA)) {
+	if (request->passthrough == 1 &&
+		(request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA || request->qtype == DNS_T_HTTPS)) {
 		request->passthrough = 2;
 	}
 }
@@ -5230,6 +5489,10 @@ static int _dns_server_do_query(struct dns_request *request, int skip_notify_eve
 	}
 
 	if (_dns_server_process_cname(request) != 0) {
+		goto clean_exit;
+	}
+
+	if (_dns_server_process_https_svcb(request) != 0) {
 		goto clean_exit;
 	}
 

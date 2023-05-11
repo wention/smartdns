@@ -2247,7 +2247,6 @@ static int _dns_client_process_udp_proxy(struct dns_server_info *server_info, st
 		return 0;
 	}
 
-
 	/* update recv time */
 	time(&server_info->last_recv);
 
